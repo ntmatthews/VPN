@@ -96,11 +96,15 @@ pki --gen --type rsa --size 4096 --outform pem > "${CONFIG_DIR}/ca/root-key.pem"
 pki --self --ca --lifetime 3650 \
     --in "${CONFIG_DIR}/ca/root-key.pem" --dn "CN=Scale2VPN Root CA" --outform pem \
     > "${CONFIG_DIR}/ca/root-cert.pem"
+openssl x509 -in "${CONFIG_DIR}/ca/root-cert.pem" -noout -ext basicConstraints \
+    | grep -q 'CA:TRUE' || fail "generated Root CA certificate is missing CA:TRUE"
 pki --gen --type rsa --size 3072 --outform pem > "${CONFIG_DIR}/ca/intermediate-key.pem"
 pki --pub --in "${CONFIG_DIR}/ca/intermediate-key.pem" \
     | pki --issue --cacert "${CONFIG_DIR}/ca/root-cert.pem" --cakey "${CONFIG_DIR}/ca/root-key.pem" \
-        --dn "CN=Scale2VPN Intermediate CA" --flag ca --lifetime 3000 --outform pem \
+        --dn "CN=Scale2VPN Intermediate CA" --ca --lifetime 3000 --outform pem \
         > "${CONFIG_DIR}/ca/intermediate-cert.pem"
+openssl x509 -in "${CONFIG_DIR}/ca/intermediate-cert.pem" -noout -ext basicConstraints \
+    | grep -q 'CA:TRUE' || fail "generated Intermediate CA certificate is missing CA:TRUE"
 pki --gen --type rsa --size 3072 --outform pem > "${IPSEC_DIR}/private/scale2vpn-server-key.pem"
 pki --pub --in "${IPSEC_DIR}/private/scale2vpn-server-key.pem" \
     | pki --issue --cacert "${CONFIG_DIR}/ca/intermediate-cert.pem" \
