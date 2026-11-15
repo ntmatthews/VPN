@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly IPV4_POOL="10.77.0.0/24"
+readonly INTERFACE_FILE="/etc/scale2vpn/public-interface"
+readonly INTERFACE_V6_FILE="/etc/scale2vpn/public-interface-v6"
+readonly IPV6_POOL_FILE="/etc/scale2vpn/ipv6-pool"
+
+fail() {
+    printf 'Scale2VPN firewall: %s\n' "$*" >&2
+    exit 1
+}
+
+case "${1:-}" in
+    start|stop)
+        ;;
+    -h|--help)
+        printf 'Usage: scale2vpn-firewall start|stop\n'
+        exit 0
+        ;;
+    *)
+        printf 'Usage: scale2vpn-firewall start|stop\n' >&2
+        exit 2
+        ;;
+esac
+
+[[ "${EUID}" -eq 0 ]] || fail "must run as root"
+[[ -r "${INTERFACE_FILE}" && -r "${INTERFACE_V6_FILE}" && -r "${IPV6_POOL_FILE}" ]] \
+    || fail "missing Scale2VPN network settings"
+public_interface="$(<"${INTERFACE_FILE}")"
+public_interface_v6="$(<"${INTERFACE_V6_FILE}")"
+ipv6_pool="$(<"${IPV6_POOL_FILE}")"
+[[ "${public_interface}" =~ ^[A-Za-z0-9_.:-]+$ && "${public_interface_v6}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
+    || fail "invalid outbound interface"
+[[ "${ipv6_pool}" =~ ^fd[0-9a-fA-F:]+/64$ ]] || fail "invalid IPv6 VPN pool"
+
+ensure_filter_rule() {
+    local binary="$1"
+    local chain="$2"
+    shift 2
+    if ! "${binary}" -C "${chain}" "$@" >/dev/null 2>&1; then
+        "${binary}" -I "${chain}" 1 "$@"
+    fi
+}
+
+remove_filter_rule() {
+    local binary="$1"
+    local chain="$2"
+    shift 2
+    if "${binary}" -C "${chain}" "$@" >/dev/null 2>&1; then
+        "${binary}" -D "${chain}" "$@"
+    fi
+}
+
+ensure_nat_rule() {
+    local binary="$1"
+    shift
+    if ! "${binary}" -t nat -C POSTROUTING "$@" >/dev/null 2>&1; then
+        "${binary}" -t nat -A POSTROUTING "$@"
+    fi
+}
+
+remove_nat_rule() {
+    local binary="$1"
+    shift
+    if "${binary}" -t nat -C POSTROUTING "$@" >/dev/null 2>&1; then
+        "${binary}" -t nat -D POSTROUTING "$@"
+    fi
+}
+
+case "${1}" in
+    start)
+        ensure_filter_rule iptables INPUT -p udp --dport 500 -j ACCEPT
+        ensure_filter_rule iptables INPUT -p udp --dport 4500 -j ACCEPT
+        ensure_filter_rule iptables FORWARD -s "${IPV4_POOL}" -m policy --dir in --pol ipsec -j ACCEPT
+        ensure_filter_rule iptables FORWARD -d "${IPV4_POOL}" -m policy --dir out --pol ipsec -j ACCEPT
+        ensure_nat_rule iptables -s "${IPV4_POOL}" -o "${public_interface}" -m policy --dir out --pol none -j MASQUERADE
+        ensure_filter_rule ip6tables INPUT -p udp --dport 500 -j ACCEPT
+        ensure_filter_rule ip6tables INPUT -p udp --dport 4500 -j ACCEPT
+        ensure_filter_rule ip6tables FORWARD -s "${ipv6_pool}" -m policy --dir in --pol ipsec -j ACCEPT
+        ensure_filter_rule ip6tables FORWARD -d "${ipv6_pool}" -m policy --dir out --pol ipsec -j ACCEPT
+        ensure_nat_rule ip6tables -s "${ipv6_pool}" -o "${public_interface_v6}" -m policy --dir out --pol none -j MASQUERADE
+        ;;
+    stop)
+        remove_nat_rule ip6tables -s "${ipv6_pool}" -o "${public_interface_v6}" -m policy --dir out --pol none -j MASQUERADE
+        remove_filter_rule ip6tables FORWARD -d "${ipv6_pool}" -m policy --dir out --pol ipsec -j ACCEPT
+        remove_filter_rule ip6tables FORWARD -s "${ipv6_pool}" -m policy --dir in --pol ipsec -j ACCEPT
+        remove_filter_rule ip6tables INPUT -p udp --dport 4500 -j ACCEPT
+        remove_filter_rule ip6tables INPUT -p udp --dport 500 -j ACCEPT
+        remove_nat_rule iptables -s "${IPV4_POOL}" -o "${public_interface}" -m policy --dir out --pol none -j MASQUERADE
+        remove_filter_rule iptables FORWARD -d "${IPV4_POOL}" -m policy --dir out --pol ipsec -j ACCEPT
+        remove_filter_rule iptables FORWARD -s "${IPV4_POOL}" -m policy --dir in --pol ipsec -j ACCEPT
+        remove_filter_rule iptables INPUT -p udp --dport 4500 -j ACCEPT
+        remove_filter_rule iptables INPUT -p udp --dport 500 -j ACCEPT
+        ;;
+esac

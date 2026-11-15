@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scale2vpn reset-console-password
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    usage
+    exit 0
+fi
+
+[[ "${EUID}" -eq 0 ]] || {
+    printf 'Scale2VPN: run this command as root.\n' >&2
+    exit 1
+}
+
+case "${1:-}" in
+    reset-console-password)
+        [[ $# -eq 1 && -d /etc/scale2vpn ]] || {
+            printf 'Scale2VPN: console is not installed or arguments are invalid.\n' >&2
+            exit 2
+        }
+        password="$(openssl rand -hex 24)"
+        temporary="$(mktemp /etc/scale2vpn/.console-password.XXXXXX)"
+        printf '%s' "${password}" | sha256sum | awk '{print $1}' \
+            > "${temporary}"
+        chmod 600 "${temporary}"
+        mv -f "${temporary}" /etc/scale2vpn/console-password.sha256
+        printf 'Console username: admin\nNew console password: %s\n' "${password}"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

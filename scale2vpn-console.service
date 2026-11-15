@@ -1,0 +1,26 @@
+[Unit]
+Description=Scale2VPN HTTPS administration console
+Requires=strongswan-starter.service
+After=strongswan-starter.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/scale2vpn/console.py
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=scale2vpn
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+ReadWritePaths=/etc/scale2vpn /etc/ipsec.d
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

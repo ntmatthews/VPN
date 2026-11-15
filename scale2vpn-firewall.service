@@ -1,0 +1,14 @@
+[Unit]
+Description=Scale2VPN IPsec forwarding and NAT rules
+Wants=network-online.target
+After=network-online.target
+Before=strongswan-starter.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/scale2vpn-firewall start
+ExecStop=/usr/local/sbin/scale2vpn-firewall stop
+
+[Install]
+WantedBy=multi-user.target
