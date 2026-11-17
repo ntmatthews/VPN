@@ -71,7 +71,7 @@ To apply the current program files from a checkout to an already installed serve
 sudo ./scale2vpn update --source .
 ```
 
-This deploys the checkout's console, command, and service unit and restarts the console. It does not change VPN settings, certificates, or issued devices. Once this update is published on `main`, future updates can be downloaded directly with:
+This deploys the checkout's console, command, and service unit and restarts the console. It does not change VPN settings, certificates, or issued devices. After updating, reload the console page before submitting forms; the console now uses a secure CSRF token instead of rejecting browser requests based on mismatched Origin/Host formatting. Once this update is published on `main`, future updates can be downloaded directly with:
 
 ```sh
 sudo scale2vpn update

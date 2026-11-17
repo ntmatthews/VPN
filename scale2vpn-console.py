@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+from http.cookies import CookieError, SimpleCookie
 import hashlib
 import hmac
 import html
@@ -109,36 +110,8 @@ def validate_display_name(value):
     return name
 
 
-def is_same_origin(origin, host):
-    if not origin or not host:
-        return False
-    try:
-        origin_url = urlparse(origin)
-        host_url = urlparse(f"//{host}")
-        origin_host = origin_url.hostname
-        request_host = host_url.hostname
-        origin_port = 443 if origin_url.port is None else origin_url.port
-        request_port = 443 if host_url.port is None else host_url.port
-    except ValueError:
-        return False
-
-    return (
-        origin_url.scheme.lower() == "https"
-        and origin_url.username is None
-        and origin_url.password is None
-        and not origin_url.path
-        and not origin_url.query
-        and not origin_url.fragment
-        and host_url.username is None
-        and host_url.password is None
-        and not host_url.path
-        and not host_url.query
-        and not host_url.fragment
-        and origin_host is not None
-        and request_host is not None
-        and origin_host.rstrip(".").casefold() == request_host.rstrip(".").casefold()
-        and origin_port == request_port
-    )
+def valid_csrf_token(cookie_token, form_token):
+    return bool(cookie_token and form_token) and hmac.compare_digest(cookie_token, form_token)
 
 
 def load_server():
@@ -355,9 +328,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_html(self, status, title, body):
+    def send_html(self, status, title, body, extra_headers=None):
         data = page(title, body).encode("utf-8")
-        self.send_bytes(status, "text/html; charset=utf-8", data)
+        self.send_bytes(status, "text/html; charset=utf-8", data, extra_headers)
 
     def authorized(self):
         authorization = self.headers.get("Authorization", "")
@@ -383,17 +356,43 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         )
         return False
 
-    def require_same_origin(self):
-        host = self.headers.get("Host", "")
-        origin = self.headers.get("Origin", "")
-        if not is_same_origin(origin, host):
-            self.send_html(403, "Request blocked", '<section class="card">Cross-origin requests are not accepted.</section>')
-            return False
-        return True
+    def get_csrf_cookie(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            pass
+        morsel = cookie.get("__Host-scale2vpn_csrf")
+        token = morsel.value if morsel else ""
+        if re.fullmatch(r"[A-Za-z0-9_-]{40,50}", token):
+            return token, None
+        token = secrets.token_urlsafe(32)
+        return token, (
+            "Set-Cookie",
+            f"__Host-scale2vpn_csrf={token}; Path=/; Secure; HttpOnly; SameSite=Strict",
+        )
+
+    def require_csrf(self, form_token):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            pass
+        morsel = cookie.get("__Host-scale2vpn_csrf")
+        cookie_token = morsel.value if morsel else ""
+        if valid_csrf_token(cookie_token, form_token):
+            return True
+        self.send_html(
+            403,
+            "Request blocked",
+            '<section class="card">Request verification failed. Reload the console and try again.</section>',
+        )
+        return False
 
     def dashboard(self, notice=""):
         server = load_server()
         devices = read_devices()
+        csrf_token, csrf_cookie = self.get_csrf_cookie()
         escaped_endpoint = html.escape(server["server_address"])
         escaped_remote_id = html.escape(server["remote_id"])
         routes = ", ".join(server["routes"])
@@ -414,6 +413,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 <h2>Add a device</h2>
 <p class="muted">Each device gets a unique certificate identity and a one-time downloadable bundle.</p>
 <form method="post" action="/devices">
+<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
 <label for="display_name">Display Name</label>
 <input id="display_name" name="display_name" maxlength="64" required autocomplete="off" placeholder="e.g. Alex's phone">
 <p><button type="submit">Create device profile</button></p>
@@ -442,13 +442,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     f"<td><code>{html.escape(device['local_id'])}</code></td>"
                     f"<td>{html.escape(device['created'])}</td>"
                     "<td><form class=\"inline\" method=\"post\" action=\"/revoke\">"
+                    f"<input type=\"hidden\" name=\"csrf_token\" value=\"{html.escape(csrf_token)}\">"
                     f"<input type=\"hidden\" name=\"device_id\" value=\"{html.escape(device_id)}\">"
                     '<button class="danger" type="submit">Revoke</button></form></td>'
                     "</tr>"
                 )
             body += "</tbody></table>"
         body += "</section>"
-        self.send_html(200, "Console", body)
+        headers = {"Set-Cookie": csrf_cookie[1]} if csrf_cookie else None
+        self.send_html(200, "Console", body, headers)
 
     def do_GET(self):
         if not self.require_auth():
@@ -486,11 +488,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         return {key: items[0] for key, items in values.items()}
 
     def do_POST(self):
-        if not self.require_auth() or not self.require_same_origin():
+        if not self.require_auth():
             return
         purge_pending_downloads()
         try:
             form = self.read_form()
+            if not self.require_csrf(form.get("csrf_token", "")):
+                return
             route = urlparse(self.path).path
             if route == "/devices":
                 display_name = validate_display_name(form.get("display_name", ""))
