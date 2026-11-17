@@ -61,6 +61,8 @@ class ConsoleValidationTests(unittest.TestCase):
             server_file.write_text(json.dumps({
                 "server_address": "vpn.example.test",
                 "remote_id": "vpn.example.test",
+                "routes": ["0.0.0.0/0"],
+                "families": ["ipv4"],
             }), encoding="utf-8")
             devices_file = root / "devices.json"
             devices_file.write_text("{}\n", encoding="utf-8")
@@ -117,7 +119,7 @@ class ConsoleValidationTests(unittest.TestCase):
                     self.assertIn("CA certificate (root): root-ca.pem", profile)
                     self.assertIn("MID certificate (intermediate): intermediate-ca.pem", profile)
                     self.assertIn("Device certificate (leaf): device-cert.pem", profile)
-                    self.assertIn("Tunnel routes: 0.0.0.0/0 and ::/0", profile)
+                    self.assertIn("Tunnel routes: 0.0.0.0/0", profile)
 
                 console.revoke_device(device_id)
                 self.assertEqual(json.loads(devices_file.read_text()), {})

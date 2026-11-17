@@ -1,33 +1,29 @@
 # Scale2VPN
 
-Scale2VPN is a lightweight, self-hosted, dual-stack IKEv2 VPN for Debian 13. It uses strongSwan, per-device X.509 certificates, a small HTTPS console, and no containers or database.
+Scale2VPN is a lightweight, self-hosted IKEv2 VPN for Debian 13. It uses strongSwan, per-device X.509 certificates, a small HTTPS console, and no containers or database. It works with IPv4-only, IPv6-only, and dual-stack VPS networks.
 
 ## Install
 
-Copy or clone the project to a fresh Debian 13 server with public IPv4 and IPv6 routes, then run:
+Copy or clone the project to a fresh Debian 13 VPS with at least one public IP route, then run:
 
 ```sh
 cd scale2vpn
 sudo ./install.sh
 ```
 
-The installer asks for a public DNS name, IPv4 address, or IPv6 address. A DNS name with both A and AAAA records is recommended. It creates a Root CA, an Intermediate CA (MID), and a server certificate, configures IPv4 and IPv6 forwarding/NAT, and starts the IKEv2 service. Allow UDP ports `500` and `4500` through the server's cloud firewall or router.
+The installer asks for the server's public DNS name, IPv4 address, or IPv6 address and the SSH port to preserve. It detects available public address families and configures only those; dual stack is optional. It creates a Root CA, an Intermediate CA (MID), and a server certificate, enables forwarding/NAT for available client address families, and starts IKEv2.
+
+The installer installs and enables UFW, allowing the selected SSH port, IKEv2 UDP ports `500` and `4500`, and rate-limited HTTPS console TCP port `8443`. It adds UFW forwarding/NAT rules for the VPN address pools. Also allow these ports in the VPS provider's external firewall/security group.
 
 ## Web console
 
-The HTTPS console listens only on `127.0.0.1:8443`. Use SSH port forwarding from your workstation:
-
-```sh
-ssh -L 8443:127.0.0.1:8443 user@your-vpn-server
-```
-
-Then copy the public Root CA certificate to your workstation and trust it in your OS/browser:
+The HTTPS console listens on public interfaces for the available IP families at port `8443`. Its certificate is issued for the server address entered during installation. Copy the public Root CA certificate securely and trust it in your OS/browser:
 
 ```sh
 ssh user@your-vpn-server 'sudo cat /etc/scale2vpn/ca/root-cert.pem' > scale2vpn-root-ca.pem
 ```
 
-Open `https://127.0.0.1:8443`. Sign in as `admin` with the one-time password printed by the installer. To reset it:
+Open `https://<server-address>:8443` (bracket IPv6 literals, for example `https://[2001:db8::1]:8443`). Sign in as `admin` with the one-time password printed by the installer. To reset it:
 
 ```sh
 sudo scale2vpn reset-console-password
@@ -54,15 +50,15 @@ Use the profile values when creating the client VPN:
 - **Local ID:** the device-specific identity shown in the profile
 - **Authentication:** certificate; import/select `device.p12` with its one-time password
 - **Trust:** install `root-ca.pem`; the intermediate and device certificates are included in the bundle
-- **Traffic:** use full-tunnel IPv4 and IPv6 (`0.0.0.0/0` and `::/0`)
+- **Traffic:** use the full-tunnel routes shown by the console for the server's available address families
 
 ## Networking and operations
 
-- Both `0.0.0.0/0` and `::/0` are routed through the VPN. IPv6 uses a randomly generated ULA pool with NAT66 to the server's IPv6 egress.
+- Available IPv4 and/or IPv6 full-tunnel routes are configured automatically. IPv6 uses a randomly generated ULA pool with NAT66 when IPv6 egress is available.
 - Server service: `sudo systemctl status strongswan-starter`
 - Web console: `sudo systemctl status scale2vpn-console`
-- Forwarding/NAT rules: `sudo systemctl status scale2vpn-firewall`
-- Console is loopback-only by default; do not expose port `8443` directly to the Internet.
+- Firewall rules: `sudo ufw status verbose`
+- The console is public on TCP `8443`; use a strong generated password and keep the system updated.
 - CA keys and server private keys are in `/etc/scale2vpn/ca/` and `/etc/ipsec.d/private/`; protect these files and back them up securely.
 
 The installer is for a fresh deployment and does not remove a pre-existing VPN configuration.

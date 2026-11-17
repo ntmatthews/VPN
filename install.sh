@@ -21,8 +21,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     apt-get update
     apt-get install -y python3
 fi
-[[ -f "${SCRIPT_DIR}/scale2vpn" && -f "${SCRIPT_DIR}/scale2vpn-firewall" \
-    && -f "${SCRIPT_DIR}/scale2vpn-firewall.service" && -f "${SCRIPT_DIR}/scale2vpn-console.py" \
+[[ -f "${SCRIPT_DIR}/scale2vpn" && -f "${SCRIPT_DIR}/scale2vpn-console.py" \
     && -f "${SCRIPT_DIR}/scale2vpn-console.service" ]] \
     || fail "Scale2VPN scripts and service units must be alongside install.sh"
 
@@ -59,15 +58,23 @@ except ValueError:
 PY
 )"
 public_interface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
-[[ "${public_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
-    || fail "could not detect the outbound IPv4 interface"
 public_interface_v6="$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
-[[ "${public_interface_v6}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
-    || fail "dual-stack VPN requires an outbound IPv6 route"
+[[ -z "${public_interface}" || "${public_interface}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
+    || fail "invalid outbound IPv4 interface"
+[[ -z "${public_interface_v6}" || "${public_interface_v6}" =~ ^[A-Za-z0-9_.:-]+$ ]] \
+    || fail "invalid outbound IPv6 interface"
+[[ -n "${public_interface}" || -n "${public_interface_v6}" ]] \
+    || fail "could not detect an outbound IPv4 or IPv6 route; a public route is required"
+
+read -r -p "SSH TCP port to keep open in UFW [22]: " ssh_port
+ssh_port="${ssh_port:-22}"
+[[ "${ssh_port}" =~ ^[0-9]{1,5}$ ]] && (( 10#${ssh_port} >= 1 && 10#${ssh_port} <= 65535 )) \
+    || fail "SSH port must be a number from 1 to 65535"
+ssh_port=$((10#${ssh_port}))
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins iptables openssl python3
+apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins ufw openssl python3
 
 [[ -d "${IPSEC_DIR}" ]] || fail "strongSwan did not create ${IPSEC_DIR}"
 [[ ! -e "${IPSEC_DIR}/scale2vpn.conf" && ! -e "${IPSEC_DIR}/scale2vpn.secrets" \
@@ -89,8 +96,29 @@ install -d -m 700 \
     "${IPSEC_DIR}/certs" "${IPSEC_DIR}/cacerts" "${IPSEC_DIR}/private"
 umask 077
 
-ula_hex="$(openssl rand -hex 5)"
-ipv6_pool="fd${ula_hex:0:2}:${ula_hex:2:4}:${ula_hex:6:4}::/64"
+ipv4_pool=""
+ipv6_pool=""
+vpn_subnets=()
+vpn_pools=()
+dns_servers=()
+if [[ -n "${public_interface}" ]]; then
+    ipv4_pool="10.77.0.0/24"
+    vpn_subnets+=("0.0.0.0/0")
+    vpn_pools+=("${ipv4_pool}")
+    dns_servers+=("1.1.1.1")
+fi
+if [[ -n "${public_interface_v6}" ]]; then
+    ula_hex="$(openssl rand -hex 5)"
+    ipv6_pool="fd${ula_hex:0:2}:${ula_hex:2:4}:${ula_hex:6:4}::/64"
+    vpn_subnets+=("::/0")
+    vpn_pools+=("${ipv6_pool}")
+    dns_servers+=("2606:4700:4700::1111")
+fi
+IFS=,
+left_subnets="${vpn_subnets[*]}"
+right_pools="${vpn_pools[*]}"
+right_dns="${dns_servers[*]}"
+unset IFS
 
 pki --gen --type rsa --size 4096 --outform pem > "${CONFIG_DIR}/ca/root-key.pem"
 pki --self --ca --lifetime 3650 \
@@ -129,13 +157,13 @@ conn scale2vpn-ikev2-device-template
     leftid=${server_identity}
     leftcert=scale2vpn-server-cert.pem
     leftsendcert=always
-    leftsubnet=0.0.0.0/0,::/0
+    leftsubnet=${left_subnets}
     right=%any
     rightid=%any
     rightauth=pubkey
     rightca="CN=Scale2VPN Intermediate CA"
-    rightsourceip=10.77.0.0/24,${ipv6_pool}
-    rightdns=1.1.1.1,2606:4700:4700::1111
+    rightsourceip=${right_pools}
+    rightdns=${right_dns}
     rightsendcert=never
     ike=aes256-sha256-modp2048,aes128-sha256-modp2048!
     esp=aes256-sha256,aes128-sha256!
@@ -152,18 +180,28 @@ EOF
 chmod 600 "${IPSEC_DIR}/scale2vpn.conf" "${IPSEC_DIR}/scale2vpn_devices.conf" \
     "${IPSEC_DIR}/scale2vpn.secrets"
 
-python3 - "${CONFIG_DIR}/server.json" "${endpoint}" "${ipv6_pool}" <<'PY'
+python3 - "${CONFIG_DIR}/server.json" "${endpoint}" "${server_identity}" \
+    "${ipv4_pool}" "${ipv6_pool}" "${left_subnets}" "${right_dns}" <<'PY'
 import json
 import os
 import sys
 
-path, endpoint, ipv6_pool = sys.argv[1:]
+path, endpoint, server_identity, ipv4_pool, ipv6_pool, routes, dns = sys.argv[1:]
+families = []
+if ipv4_pool:
+    families.append("ipv4")
+if ipv6_pool:
+    families.append("ipv6")
 with open(path, "w", encoding="utf-8") as output:
     json.dump({
         "display_name": "Scale2VPN",
         "server_address": endpoint,
-        "remote_id": endpoint,
-        "ipv6_pool": ipv6_pool,
+        "remote_id": server_identity,
+        "ipv4_pool": ipv4_pool or None,
+        "ipv6_pool": ipv6_pool or None,
+        "routes": routes.split(","),
+        "dns": dns.split(","),
+        "families": families,
     }, output, indent=2)
     output.write("\n")
 os.chmod(path, 0o600)
@@ -171,9 +209,10 @@ PY
 printf '{}\n' > "${CONFIG_DIR}/devices.json"
 printf '%s\n' "${public_interface}" > "${CONFIG_DIR}/public-interface"
 printf '%s\n' "${public_interface_v6}" > "${CONFIG_DIR}/public-interface-v6"
+printf '%s\n' "${ipv4_pool}" > "${CONFIG_DIR}/ipv4-pool"
 printf '%s\n' "${ipv6_pool}" > "${CONFIG_DIR}/ipv6-pool"
 chmod 600 "${CONFIG_DIR}/devices.json" "${CONFIG_DIR}/public-interface" \
-    "${CONFIG_DIR}/public-interface-v6" "${CONFIG_DIR}/ipv6-pool"
+    "${CONFIG_DIR}/public-interface-v6" "${CONFIG_DIR}/ipv4-pool" "${CONFIG_DIR}/ipv6-pool"
 
 console_password="$(openssl rand -hex 24)"
 printf '%s' "${console_password}" | sha256sum | awk '{print $1}' \
@@ -181,25 +220,75 @@ printf '%s' "${console_password}" | sha256sum | awk '{print $1}' \
 chmod 600 "${CONFIG_DIR}/console-password.sha256"
 
 install -m 755 "${SCRIPT_DIR}/scale2vpn" /usr/local/bin/scale2vpn
-install -m 755 "${SCRIPT_DIR}/scale2vpn-firewall" /usr/local/sbin/scale2vpn-firewall
 install -d -m 755 /usr/local/lib/scale2vpn
 install -m 755 "${SCRIPT_DIR}/scale2vpn-console.py" /usr/local/lib/scale2vpn/console.py
-install -m 644 "${SCRIPT_DIR}/scale2vpn-firewall.service" /etc/systemd/system/scale2vpn-firewall.service
 install -m 644 "${SCRIPT_DIR}/scale2vpn-console.service" /etc/systemd/system/scale2vpn-console.service
+
 cat > /etc/sysctl.d/90-scale2vpn.conf <<EOF
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-net.ipv6.conf.default.forwarding=1
-net.ipv6.conf.${public_interface_v6}.accept_ra=2
+$(if [[ -n "${public_interface}" ]]; then printf '%s\n' 'net.ipv4.ip_forward=1'; fi)
+$(if [[ -n "${public_interface_v6}" ]]; then
+    printf '%s\n' 'net.ipv6.conf.all.forwarding=1' 'net.ipv6.conf.default.forwarding=1'
+    printf 'net.ipv6.conf.%s.accept_ra=2\n' "${public_interface_v6}"
+fi)
 EOF
 sysctl --system >/dev/null
+
+ufw_ipv6="no"
+[[ -z "${public_interface_v6}" ]] || ufw_ipv6="yes"
+sed -i "s/^IPV6=.*/IPV6=${ufw_ipv6}/" /etc/default/ufw
+
+python3 - "${ipv4_pool}" "${public_interface}" "${ipv6_pool}" "${public_interface_v6}" <<'PY'
+import sys
+from pathlib import Path
+
+begin = "# BEGIN SCALE2VPN NAT"
+end = "# END SCALE2VPN NAT"
+families = (
+    (Path("/etc/ufw/before.rules"), sys.argv[1], sys.argv[2]),
+    (Path("/etc/ufw/before6.rules"), sys.argv[3], sys.argv[4]),
+)
+for path, pool, interface in families:
+    text = path.read_text(encoding="utf-8")
+    start = text.find(begin)
+    if start >= 0:
+        finish = text.find(end, start)
+        if finish < 0:
+            raise SystemExit(f"Unterminated Scale2VPN NAT block in {path}")
+        finish += len(end)
+        text = text[:start] + text[finish:]
+    if pool and interface:
+        block = (
+            f"{begin}\n*nat\n:POSTROUTING ACCEPT [0:0]\n"
+            f"-A POSTROUTING -s {pool} -o {interface} -j MASQUERADE\n"
+            f"COMMIT\n{end}\n"
+        )
+        text = block + text
+    path.write_text(text, encoding="utf-8")
+PY
+
+ufw allow "${ssh_port}/tcp"
+ufw allow 500/udp
+ufw allow 4500/udp
+ufw limit 8443/tcp
+if [[ -n "${ipv4_pool}" ]]; then
+    ufw route allow in on "${public_interface}" out on "${public_interface}" from "${ipv4_pool}" to any
+fi
+if [[ -n "${ipv6_pool}" ]]; then
+    ufw route allow in on "${public_interface_v6}" out on "${public_interface_v6}" from "${ipv6_pool}" to any
+fi
+ufw --force enable
+
 systemctl daemon-reload
-systemctl enable --now scale2vpn-firewall.service
 systemctl enable --now strongswan-starter.service
 systemctl enable --now scale2vpn-console.service
 
-printf '\nScale2VPN dual-stack IKEv2 is running.\n'
+printf '\nScale2VPN IKEv2 is running.\n'
 printf 'Server address / remote ID: %s\n' "${endpoint}"
-printf 'Web console: https://127.0.0.1:8443 (use SSH port forwarding)\n'
+if [[ "${endpoint}" == *:* ]]; then
+    printf 'Web console: https://[%s]:8443\n' "${endpoint}"
+else
+    printf 'Web console: https://%s:8443\n' "${endpoint}"
+fi
 printf 'Console username: admin\nConsole password (shown once): %s\n' "${console_password}"
-printf 'Allow UDP ports 500 and 4500 through your cloud firewall/router.\n'
+printf 'UFW allows SSH on TCP %s, IKEv2 on UDP 500/4500, and the rate-limited console on TCP 8443.\n' "${ssh_port}"
+printf 'Also permit those ports in your VPS provider firewall/security group.\n'

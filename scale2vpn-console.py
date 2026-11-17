@@ -9,12 +9,14 @@ import logging
 import os
 import re
 import secrets
+import socket
 import ssl
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -197,7 +199,7 @@ def issue_device(display_name):
             "Identity package: device.p12\n"
             "Import password: shown once in the Scale2VPN console\n"
             "Trust chain: device certificate -> intermediate CA -> root CA\n"
-            "Tunnel routes: 0.0.0.0/0 and ::/0\n"
+            f"Tunnel routes: {', '.join(server['routes'])}\n"
         )
         bundle_buffer = io.BytesIO()
         with zipfile.ZipFile(bundle_buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
@@ -362,15 +364,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         devices = read_devices()
         escaped_endpoint = html.escape(server["server_address"])
         escaped_remote_id = html.escape(server["remote_id"])
+        routes = ", ".join(server["routes"])
+        console_url = f"https://{server['server_address']}"
+        if ":" in server["server_address"]:
+            console_url = f"https://[{server['server_address']}]"
         body = f"""<p class="muted">Certificate-authenticated IKEv2 administration</p>
 <section class="card">
 <h2>Server</h2>
 <div class="grid">
 <div><span class="muted">Server Address</span><br><code>{escaped_endpoint}</code></div>
 <div><span class="muted">Remote ID</span><br><code>{escaped_remote_id}</code></div>
-<div><span class="muted">Tunnel routes</span><br><code>0.0.0.0/0, ::/0</code></div>
+<div><span class="muted">Tunnel routes</span><br><code>{html.escape(routes)}</code></div>
 </div>
-<p class="muted">The web console is bound to localhost. Connect through SSH port forwarding.</p>
+<p class="muted">Console: <a href="{html.escape(console_url)}:8443">{html.escape(console_url)}:8443</a></p>
 </section>
 <section class="card">
 <h2>Add a device</h2>
@@ -486,13 +492,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    server = HTTPServer(("127.0.0.1", 8443), ConsoleHandler)
+    server_config = load_server()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=SERVER_CERT, keyfile=SERVER_KEY)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
-    logging.info("Scale2VPN console listening on https://127.0.0.1:8443")
-    server.serve_forever()
+
+    servers = []
+    if "ipv4" in server_config["families"]:
+        ipv4_server = ThreadingHTTPServer(("0.0.0.0", 8443), ConsoleHandler)
+        ipv4_server.socket = context.wrap_socket(ipv4_server.socket, server_side=True)
+        servers.append(ipv4_server)
+    if "ipv6" in server_config["families"]:
+        class IPv6HTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+            def server_bind(self):
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                super().server_bind()
+
+        ipv6_server = IPv6HTTPServer(("::", 8443), ConsoleHandler)
+        ipv6_server.socket = context.wrap_socket(ipv6_server.socket, server_side=True)
+        servers.append(ipv6_server)
+
+    if not servers:
+        raise RuntimeError("No public IP family is configured for the console")
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    logging.info("Scale2VPN public HTTPS console listening on port 8443")
+    servers[0].serve_forever()
 
 
 if __name__ == "__main__":
