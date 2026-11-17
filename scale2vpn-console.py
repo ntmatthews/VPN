@@ -109,6 +109,38 @@ def validate_display_name(value):
     return name
 
 
+def is_same_origin(origin, host):
+    if not origin or not host:
+        return False
+    try:
+        origin_url = urlparse(origin)
+        host_url = urlparse(f"//{host}")
+        origin_host = origin_url.hostname
+        request_host = host_url.hostname
+        origin_port = 443 if origin_url.port is None else origin_url.port
+        request_port = 443 if host_url.port is None else host_url.port
+    except ValueError:
+        return False
+
+    return (
+        origin_url.scheme.lower() == "https"
+        and origin_url.username is None
+        and origin_url.password is None
+        and not origin_url.path
+        and not origin_url.query
+        and not origin_url.fragment
+        and host_url.username is None
+        and host_url.password is None
+        and not host_url.path
+        and not host_url.query
+        and not host_url.fragment
+        and origin_host is not None
+        and request_host is not None
+        and origin_host.rstrip(".").casefold() == request_host.rstrip(".").casefold()
+        and origin_port == request_port
+    )
+
+
 def load_server():
     with SERVER_FILE.open(encoding="utf-8") as source:
         return json.load(source)
@@ -354,7 +386,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def require_same_origin(self):
         host = self.headers.get("Host", "")
         origin = self.headers.get("Origin", "")
-        if not host or origin != f"https://{host}":
+        if not is_same_origin(origin, host):
             self.send_html(403, "Request blocked", '<section class="card">Cross-origin requests are not accepted.</section>')
             return False
         return True

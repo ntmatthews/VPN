@@ -74,7 +74,7 @@ ssh_port=$((10#${ssh_port}))
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins ufw openssl python3
+apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins ufw openssl python3 git
 
 [[ -d "${IPSEC_DIR}" ]] || fail "strongSwan did not create ${IPSEC_DIR}"
 [[ ! -e "${IPSEC_DIR}/scale2vpn.conf" && ! -e "${IPSEC_DIR}/scale2vpn.secrets" \

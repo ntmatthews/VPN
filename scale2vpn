@@ -5,6 +5,8 @@ usage() {
     cat <<'EOF'
 Usage:
   scale2vpn reset-console-password
+  scale2vpn update
+  scale2vpn update --source DIRECTORY
 EOF
 }
 
@@ -19,6 +21,54 @@ fi
 }
 
 case "${1:-}" in
+    update)
+        if [[ $# -ne 1 && $# -ne 3 ]] || { [[ $# -eq 3 && "${2:-}" != "--source" ]]; }; then
+            usage >&2
+            exit 2
+        fi
+        [[ -d /etc/scale2vpn && -f /usr/local/lib/scale2vpn/console.py ]] || {
+            printf 'Scale2VPN: the console is not installed.\n' >&2
+            exit 2
+        }
+        command -v systemctl >/dev/null 2>&1 || {
+            printf 'Scale2VPN: systemctl is required to apply updates.\n' >&2
+            exit 1
+        }
+        if [[ $# -eq 3 ]]; then
+            [[ -d "${3}" ]] || {
+                printf 'Scale2VPN: update source directory does not exist: %s\n' "${3}" >&2
+                exit 2
+            }
+            source_dir="$(cd -- "${3}" && pwd)"
+        else
+            command -v git >/dev/null 2>&1 || {
+                printf 'Scale2VPN: git is required to download updates.\n' >&2
+                exit 1
+            }
+            temporary="$(mktemp -d /tmp/scale2vpn-update.XXXXXX)"
+            trap 'rm -rf -- "${temporary}"' EXIT
+            source_dir="${temporary}/source"
+            printf 'Downloading the latest Scale2VPN program files...\n'
+            git clone --quiet --depth 1 --branch main \
+                https://github.com/ntmatthews/VPN.git "${source_dir}"
+        fi
+        for file in scale2vpn scale2vpn-console.py scale2vpn-console.service; do
+            [[ -f "${source_dir}/${file}" ]] || {
+                printf 'Scale2VPN: update is missing required file %s.\n' "${file}" >&2
+                exit 1
+            }
+        done
+        python3 -c 'import pathlib, sys; compile(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[1], "exec")' \
+            "${source_dir}/scale2vpn-console.py"
+        install -o root -g root -m 755 "${source_dir}/scale2vpn" /usr/local/bin/scale2vpn
+        install -o root -g root -m 755 "${source_dir}/scale2vpn-console.py" \
+            /usr/local/lib/scale2vpn/console.py
+        install -o root -g root -m 644 "${source_dir}/scale2vpn-console.service" \
+            /etc/systemd/system/scale2vpn-console.service
+        systemctl daemon-reload
+        systemctl restart scale2vpn-console.service
+        printf 'Scale2VPN program files updated. VPN settings, certificates, and devices were not changed.\n'
+        ;;
     reset-console-password)
         [[ $# -eq 1 && -d /etc/scale2vpn ]] || {
             printf 'Scale2VPN: console is not installed or arguments are invalid.\n' >&2

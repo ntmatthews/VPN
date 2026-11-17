@@ -15,6 +15,30 @@ SPEC.loader.exec_module(console)
 
 
 class ConsoleValidationTests(unittest.TestCase):
+    def test_same_origin_accepts_equivalent_https_hosts(self):
+        self.assertTrue(console.is_same_origin(
+            "https://VPN.Example.Test:8443",
+            "vpn.example.test.:8443",
+        ))
+        self.assertTrue(console.is_same_origin("https://vpn.example.test", "vpn.example.test"))
+        self.assertTrue(console.is_same_origin(
+            "https://vpn.example.test:443",
+            "vpn.example.test",
+        ))
+
+    def test_same_origin_rejects_cross_origin_and_malformed_values(self):
+        for origin, host in (
+            ("http://vpn.example.test:8443", "vpn.example.test:8443"),
+            ("https://attacker.example:8443", "vpn.example.test:8443"),
+            ("https://vpn.example.test:443", "vpn.example.test:8443"),
+            ("https://vpn.example.test/path", "vpn.example.test"),
+            ("https://user@vpn.example.test", "vpn.example.test"),
+            ("null", "vpn.example.test"),
+            ("https://vpn.example.test:invalid", "vpn.example.test"),
+        ):
+            with self.subTest(origin=origin, host=host):
+                self.assertFalse(console.is_same_origin(origin, host))
+
     def test_device_connection_is_bound_to_its_local_identity(self):
         config = console.render_devices_config(
             {

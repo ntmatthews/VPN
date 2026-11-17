@@ -62,3 +62,24 @@ Use the profile values when creating the client VPN:
 - CA keys and server private keys are in `/etc/scale2vpn/ca/` and `/etc/ipsec.d/private/`; protect these files and back them up securely.
 
 The installer is for a fresh deployment and does not remove a pre-existing VPN configuration.
+
+## Updating
+
+To apply the current program files from a checkout to an already installed server, run from the project directory:
+
+```sh
+sudo ./scale2vpn update --source .
+```
+
+This deploys the checkout's console, command, and service unit and restarts the console. It does not change VPN settings, certificates, or issued devices. Once this update is published on `main`, future updates can be downloaded directly with:
+
+```sh
+sudo scale2vpn update
+```
+
+The updater requires network access to GitHub and `git`. The installer includes `git` for new deployments. Check the service if an update fails to start:
+
+```sh
+sudo systemctl status scale2vpn-console
+sudo journalctl -u scale2vpn-console --since today
+```
