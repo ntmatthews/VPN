@@ -1,6 +1,7 @@
 import io
 import importlib.util
 import json
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -59,6 +60,163 @@ class ConsoleValidationTests(unittest.TestCase):
             console.render_devices_config(
                 {"not-a-safe-id": {"local_id": "s2v-0123456789ab"}}
             )
+
+    def test_device_status_uses_established_connection_state(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            devices_file = Path(temporary_dir) / "devices.json"
+            connected_id = "a" * 24
+            disconnected_id = "b" * 24
+            devices_file.write_text(json.dumps({
+                connected_id: {
+                    "display_name": "Phone",
+                    "local_id": "s2v-0123456789ab",
+                    "created": "2026-11-15 12:00:00 UTC",
+                },
+                disconnected_id: {
+                    "display_name": "Tablet",
+                    "local_id": "s2v-abcdef012345",
+                    "created": "2026-11-15 12:01:00 UTC",
+                },
+            }), encoding="utf-8")
+            statusall = (
+                f"scale2vpn-device-{connected_id}: #1, ESTABLISHED, IKEv2\n"
+                f"scale2vpn-device-{disconnected_id}: %any...%any IKEv2\n"
+            )
+            with mock.patch.object(console, "DEVICES_FILE", devices_file), \
+                    mock.patch.object(console, "ipsec_service_active", return_value=True), \
+                    mock.patch.object(console, "run_tool", return_value=statusall.encode()):
+                rows = console.device_status_rows()
+
+        self.assertEqual([row[2] for row in rows], ["connected", "disconnected"])
+
+    def test_dashboard_shows_branding_and_live_device_state(self):
+        handler = object.__new__(console.ConsoleHandler)
+        response = {}
+        handler.send_html = lambda status, title, body, headers=None: response.update(
+            status=status, title=title, body=body, headers=headers
+        )
+        handler.get_csrf_cookie = lambda: ("csrf-token", None)
+        devices = [
+            (
+                "a" * 24,
+                {
+                    "display_name": "Phone",
+                    "local_id": "s2v-0123456789ab",
+                    "created": "2026-11-15 12:00:00 UTC",
+                },
+                "connected",
+            )
+        ]
+        with mock.patch.object(console, "load_server", return_value={
+            "server_address": "vpn.example.test",
+            "console_domain": "admin.example.test",
+            "remote_id": "@vpn.example.test",
+            "routes": ["0.0.0.0/0"],
+            "families": ["ipv4"],
+        }), mock.patch.object(console, "ipsec_service_active", return_value=True), \
+                mock.patch.object(console, "device_status_rows", return_value=devices):
+            console.ConsoleHandler.dashboard(handler)
+
+        rendered = console.page(response["title"], response["body"])
+        self.assertEqual(response["status"], 200)
+        self.assertIn("Scale2VPN by Hyperforge Studios", rendered)
+        self.assertIn("Nathan Thomas Matthews, doing business as Hyperforge Studios", rendered)
+        self.assertIn("Connected now</div><div class=\"stat-value\">1", rendered)
+        self.assertIn("https://admin.example.test:8443", rendered)
+        self.assertIn('name="action" value="stop"', rendered)
+        self.assertIn("Phone", rendered)
+        self.assertIn("connected", rendered)
+
+    def test_dashboard_vpn_control_uses_systemd_and_reports_result(self):
+        handler = object.__new__(console.ConsoleHandler)
+        handler.path = "/vpn"
+        notices = []
+        commands = []
+        handler.require_auth = lambda: True
+        handler.read_form = lambda: {"csrf_token": "token", "action": "stop"}
+        handler.require_csrf = lambda token: token == "token"
+        handler.dashboard = lambda notice="": notices.append(notice)
+        with mock.patch.object(
+            console, "run_tool", side_effect=lambda args, **kwargs: commands.append(args) or b""
+        ):
+            handler.do_POST()
+
+        self.assertEqual(commands, [["systemctl", "stop", "strongswan-starter.service"]])
+        self.assertEqual(notices, ["VPN service stopped."])
+
+    def test_console_lets_encrypt_requires_a_public_dns_name(self):
+        self.assertEqual(console.validate_dns_name(" VPN.Example.Test. "), "vpn.example.test")
+        self.assertTrue(console.valid_contact_email("admin@example.test"))
+        with self.assertRaises(ValueError):
+            console.validate_dns_name("203.0.113.4")
+        with self.assertRaises(ValueError):
+            console.validate_dns_name("localhost")
+        self.assertFalse(console.valid_contact_email("not-an-email"))
+
+    def test_console_tls_paths_preserve_legacy_certificates_and_use_lets_encrypt(self):
+        self.assertEqual(console.console_tls_paths({}), (console.SERVER_CERT, console.SERVER_KEY))
+        with mock.patch.object(console, "LETSENCRYPT_DIR", Path("/etc/letsencrypt/live")):
+            certificate, private_key = console.console_tls_paths(
+                {"console_domain": "admin.example.test"}
+            )
+        self.assertEqual(
+            certificate,
+            Path("/etc/letsencrypt/live")
+            / console.letsencrypt_certificate_name("admin.example.test")
+            / "fullchain.pem",
+        )
+        self.assertEqual(
+            private_key,
+            Path("/etc/letsencrypt/live")
+            / console.letsencrypt_certificate_name("admin.example.test")
+            / "privkey.pem",
+        )
+
+    def test_tls_setup_issues_public_cert_and_installs_renewal_hook(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            server_file = root / "server.json"
+            server_file.write_text(json.dumps({
+                "server_address": "vpn.example.test",
+                "remote_id": "@vpn.example.test",
+            }), encoding="utf-8")
+            certificate_dir = root / "live" / console.letsencrypt_certificate_name(
+                "admin.example.test"
+            )
+            certificate_dir.mkdir(parents=True)
+            (certificate_dir / "fullchain.pem").write_text("certificate", encoding="ascii")
+            (certificate_dir / "privkey.pem").write_text("private key", encoding="ascii")
+            hook_path = root / "renewal-hooks" / "scale2vpn-reload-console"
+            commands = []
+
+            def record_command(args, *, input_data=None, timeout=60):
+                commands.append(args)
+                return b""
+
+            with mock.patch.object(console.os, "geteuid", return_value=0), \
+                    mock.patch.object(console.shutil, "which", return_value="/usr/bin/certbot"), \
+                    mock.patch.object(console, "SERVER_FILE", server_file), \
+                    mock.patch.object(console, "LETSENCRYPT_DIR", root / "live"), \
+                    mock.patch.object(console, "TLS_RENEWAL_HOOK", hook_path), \
+                    mock.patch.object(console, "run_tool", side_effect=record_command):
+                domain = console.configure_console_tls(
+                    "ADMIN.Example.Test", "admin@example.test"
+                )
+            updated_server = json.loads(server_file.read_text(encoding="utf-8"))
+            self.assertEqual(domain, "admin.example.test")
+            self.assertEqual(updated_server["console_domain"], "admin.example.test")
+            self.assertIn(
+                ["certbot", "certonly", "--standalone", "--non-interactive", "--agree-tos",
+                 "--email", "admin@example.test", "--cert-name",
+                 console.letsencrypt_certificate_name("admin.example.test"),
+                 "--domain", "admin.example.test"],
+                commands,
+            )
+            self.assertIn(["systemctl", "enable", "--now", "certbot.timer"], commands)
+            self.assertIn(["systemctl", "restart", "scale2vpn-console.service"], commands)
+            hook = hook_path.read_text(encoding="utf-8")
+            self.assertIn("RENEWED_LINEAGE", hook)
+            self.assertTrue(stat.S_IMODE(hook_path.stat().st_mode) & stat.S_IXUSR)
 
     def test_display_name_limits_and_trims_whitespace(self):
         self.assertEqual(console.validate_display_name("  Tablet  "), "Tablet")

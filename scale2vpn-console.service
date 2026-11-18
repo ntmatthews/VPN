@@ -1,7 +1,7 @@
 [Unit]
 Description=Scale2VPN HTTPS administration console
-Requires=strongswan-starter.service
-After=strongswan-starter.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple

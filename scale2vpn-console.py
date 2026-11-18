@@ -4,6 +4,7 @@ from http.cookies import CookieError, SimpleCookie
 import hashlib
 import hmac
 import html
+import ipaddress
 import io
 import json
 import logging
@@ -11,8 +12,10 @@ import os
 import re
 import secrets
 import socket
+import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,6 +34,8 @@ DEVICES_CONFIG = Path("/etc/ipsec.d/scale2vpn_devices.conf")
 CERT_DIR = Path("/etc/ipsec.d/certs")
 SERVER_CERT = CERT_DIR / "scale2vpn-console-chain.pem"
 SERVER_KEY = Path("/etc/ipsec.d/private/scale2vpn-server-key.pem")
+LETSENCRYPT_DIR = Path("/etc/letsencrypt/live")
+TLS_RENEWAL_HOOK = Path("/etc/letsencrypt/renewal-hooks/deploy/scale2vpn-reload-console")
 RUNTIME_DIR = Path("/run/scale2vpn")
 PASSWORD_HASH_FILE = CONFIG_DIR / "console-password.sha256"
 DEVICE_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
@@ -51,6 +56,19 @@ def run_tool(args, *, input_data=None, timeout=60):
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"{Path(args[0]).name} failed: {detail}")
     return result.stdout
+
+
+def ipsec_service_active():
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "strongswan-starter.service"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
 
 
 def atomic_write(path, data, mode=0o600):
@@ -117,6 +135,92 @@ def valid_csrf_token(cookie_token, form_token):
 def load_server():
     with SERVER_FILE.open(encoding="utf-8") as source:
         return json.load(source)
+
+
+def validate_dns_name(value):
+    name = value.strip().rstrip(".").lower()
+    labels = name.split(".")
+    if (
+        len(name) > 253
+        or len(labels) < 2
+        or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in labels
+        )
+    ):
+        raise ValueError("Enter a public DNS name with at least two valid labels.")
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return name
+    raise ValueError("Let's Encrypt requires a DNS name; IP addresses are not accepted here.")
+
+
+def console_tls_paths(server_config):
+    domain = server_config.get("console_domain")
+    if not domain:
+        return SERVER_CERT, SERVER_KEY
+    live_directory = LETSENCRYPT_DIR / letsencrypt_certificate_name(domain)
+    return live_directory / "fullchain.pem", live_directory / "privkey.pem"
+
+
+def letsencrypt_certificate_name(domain):
+    domain = validate_dns_name(domain)
+    suffix = hashlib.sha256(domain.encode("ascii")).hexdigest()[:16]
+    return f"s2vpn-{suffix}"
+
+
+def valid_contact_email(value):
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+", value.strip()))
+
+
+def configure_console_tls(domain, email):
+    if os.geteuid() != 0:
+        raise RuntimeError("Run TLS setup as root.")
+    domain = validate_dns_name(domain)
+    email = email.strip()
+    if not valid_contact_email(email):
+        raise ValueError("Enter a valid email address for Let's Encrypt certificate notices.")
+
+    if not shutil.which("certbot"):
+        run_tool(["apt-get", "update"], timeout=300)
+        run_tool(["apt-get", "install", "-y", "certbot"], timeout=600)
+    run_tool(["ufw", "allow", "80/tcp", "comment", "Scale2VPN ACME validation"])
+    run_tool(
+        [
+            "certbot", "certonly", "--standalone", "--non-interactive",
+            "--agree-tos", "--email", email, "--cert-name",
+            letsencrypt_certificate_name(domain), "--domain", domain,
+        ],
+        timeout=300,
+    )
+
+    certificate, private_key = console_tls_paths({"console_domain": domain})
+    if not certificate.is_file() or not private_key.is_file():
+        raise RuntimeError("Certbot completed without creating the expected certificate files.")
+
+    server = load_server()
+    server["console_domain"] = domain
+    atomic_write(
+        SERVER_FILE,
+        (json.dumps(server, indent=2) + "\n").encode("utf-8"),
+        0o600,
+    )
+    hook = TLS_RENEWAL_HOOK
+    hook.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    atomic_write(
+        hook,
+        b"""#!/bin/sh
+set -eu
+        cert_name="$(/usr/bin/python3 -c 'import hashlib, json; domain=json.load(open("/etc/scale2vpn/server.json"))["console_domain"]; print("s2vpn-"+hashlib.sha256(domain.encode()).hexdigest()[:16])')"
+        [ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/${cert_name}" ] || exit 0
+exec /usr/bin/systemctl restart scale2vpn-console.service
+""",
+        0o755,
+    )
+    run_tool(["systemctl", "enable", "--now", "certbot.timer"])
+    run_tool(["systemctl", "restart", "scale2vpn-console.service"])
+    return domain
 
 
 def purge_pending_downloads():
@@ -224,15 +328,17 @@ def issue_device(display_name):
     try:
         atomic_write(DEVICES_FILE, serialize_devices(devices))
         atomic_write(DEVICES_CONFIG, render_devices_config(devices), 0o600)
-        run_tool(["ipsec", "reload"])
+        if ipsec_service_active():
+            run_tool(["ipsec", "reload"])
     except Exception:
         atomic_write(DEVICES_FILE, old_database)
         atomic_write(DEVICES_CONFIG, old_connections, 0o600)
         cert_path.unlink(missing_ok=True)
-        try:
-            run_tool(["ipsec", "reload"])
-        except Exception:
-            logging.exception("Could not reload the previous strongSwan configuration")
+        if ipsec_service_active():
+            try:
+                run_tool(["ipsec", "reload"])
+            except Exception:
+                logging.exception("Could not reload the previous strongSwan configuration")
         raise
 
     token = secrets.token_urlsafe(24)
@@ -253,10 +359,12 @@ def revoke_device(device_id):
     device = devices.get(device_id)
     if device is None:
         raise ValueError("Device not found.")
-    try:
-        run_tool(["ipsec", "down", f"scale2vpn-device-{device_id}"])
-    except RuntimeError:
-        logging.warning("No active IKE_SA was disconnected for device %s", device_id)
+    service_active = ipsec_service_active()
+    if service_active:
+        try:
+            run_tool(["ipsec", "down", f"scale2vpn-device-{device_id}"])
+        except RuntimeError:
+            logging.warning("No active IKE_SA was disconnected for device %s", device_id)
 
     updated = dict(devices)
     del updated[device_id]
@@ -266,16 +374,19 @@ def revoke_device(device_id):
     try:
         atomic_write(DEVICES_FILE, serialize_devices(updated))
         atomic_write(DEVICES_CONFIG, render_devices_config(updated), 0o600)
-        run_tool(["ipsec", "reload"])
+        if service_active:
+            run_tool(["ipsec", "reload"])
     except Exception:
         atomic_write(DEVICES_FILE, old_database)
         atomic_write(DEVICES_CONFIG, old_connections, 0o600)
-        try:
-            run_tool(["ipsec", "reload"])
-        except Exception:
-            logging.exception("Could not reload the previous strongSwan configuration")
+        if service_active:
+            try:
+                run_tool(["ipsec", "reload"])
+            except Exception:
+                logging.exception("Could not reload the previous strongSwan configuration")
         raise
     certificate_path.unlink(missing_ok=True)
+    (Path("/root/scale2vpn-devices") / f"Scale2VPN-{device_id}.zip").unlink(missing_ok=True)
     return device
 
 
@@ -285,27 +396,82 @@ def page(title, body):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="application-name" content="s2vpn">
+<meta name="theme-color" content="#111018">
 <title>{html.escape(title)} · Scale2VPN</title>
 <style>
-body {{ margin: 0; background: #0c1118; color: #e7edf5; font: 16px system-ui, sans-serif; }}
-main {{ max-width: 920px; margin: 40px auto; padding: 0 20px; }}
-h1, h2 {{ letter-spacing: -.025em; }}
-.card {{ background: #151d28; border: 1px solid #293648; border-radius: 12px; padding: 22px; margin: 18px 0; }}
-.muted {{ color: #a7b3c2; }}
-label {{ display: block; margin: 12px 0 6px; }}
-input {{ box-sizing: border-box; width: 100%; padding: 11px; border-radius: 7px; border: 1px solid #40516a; background: #0c1118; color: #fff; }}
-button, .button {{ display: inline-block; border: 0; border-radius: 7px; padding: 10px 15px; background: #68a7ff; color: #071321; font-weight: 700; text-decoration: none; cursor: pointer; }}
-button.danger {{ background: #ff8e8e; }}
+* {{ box-sizing: border-box; }}
+:root {{ color-scheme: dark; --bg: #111018; --panel: #1b1924; --panel-2: #211e2c; --line: #343044; --text: #f7f3ff; --muted: #aaa4ba; --purple: #c7a6ff; --pink: #ff83cc; --mint: #72edc2; }}
+body {{ margin: 0; min-height: 100vh; background: radial-gradient(ellipse at 82% -10%, #332047 0, transparent 38%), var(--bg); color: var(--text); font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+a {{ color: var(--purple); }}
+.topbar {{ max-width: 1160px; margin: auto; padding: 26px 26px 20px; display: flex; justify-content: space-between; align-items: center; gap: 20px; border-bottom: 1px solid #ffffff12; }}
+.brand {{ display: flex; align-items: center; gap: 12px; color: var(--text); text-decoration: none; font-weight: 800; font-size: 17px; letter-spacing: -.03em; }}
+.brand-mark {{ width: 42px; height: 42px; display: grid; place-items: center; border-radius: 14px; color: #17121e; background: linear-gradient(135deg, var(--pink), var(--purple) 62%, #8debd0); font-size: 14px; letter-spacing: -.08em; box-shadow: 0 8px 26px #bd85ff35; }}
+.brand-sub {{ display: block; margin-top: -2px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .16em; }}
+.top-pill, .eyebrow {{ color: var(--purple); font-size: 11px; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }}
+main {{ width: min(1160px, 100%); margin: 0 auto; padding: 28px 26px 52px; }}
+.hero {{ display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; padding: 34px 0 28px; }}
+h1 {{ max-width: 760px; margin: 7px 0 12px; font-size: clamp(32px, 5vw, 54px); line-height: 1.04; letter-spacing: -.06em; }}
+h1 .gradient {{ color: var(--purple); background: linear-gradient(90deg, var(--pink), var(--purple), #8debd0); background-clip: text; -webkit-text-fill-color: transparent; }}
+h2 {{ margin: 0; font-size: 19px; letter-spacing: -.035em; }}
+h3 {{ margin: 0; font-size: 14px; }}
+.lede, .muted {{ color: var(--muted); }}
+.lede {{ max-width: 620px; margin: 0; font-size: 16px; }}
+.card {{ min-width: 0; padding: 22px; background: linear-gradient(145deg, #211e2c, #191720); border: 1px solid var(--line); border-radius: 19px; box-shadow: 0 15px 40px #09070e24; }}
+.card-head {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }}
+.status-chip, .badge {{ display: inline-flex; align-items: center; gap: 8px; border: 1px solid #ffffff1a; border-radius: 999px; padding: 8px 12px; color: var(--muted); background: #ffffff08; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }}
+.status-dot {{ width: 8px; height: 8px; display: inline-block; border-radius: 50%; background: #888; }}
+.online .status-dot {{ background: var(--mint); box-shadow: 0 0 14px #72edc2a0; }}
+.online.status-chip {{ color: var(--mint); border-color: #72edc245; }}
+.offline .status-dot {{ background: var(--pink); }}
+.stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 13px; margin: 16px 0; }}
+.stat {{ padding: 18px 20px; background: #ffffff07; border: 1px solid var(--line); border-radius: 16px; }}
+.stat-label {{ color: var(--muted); font-size: 12px; }}
+.stat-value {{ margin-top: 5px; font-size: 25px; font-weight: 800; letter-spacing: -.05em; }}
+.stat-caption {{ margin-top: 1px; color: var(--muted); font-size: 11px; }}
+.layout {{ display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(300px, .85fr); gap: 16px; margin-top: 16px; }}
+.detail-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }}
+.detail-label {{ display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }}
+code {{ color: #e2d0ff; overflow-wrap: anywhere; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }}
+.server-url {{ display: block; margin-top: 15px; padding: 13px 15px; border: 1px solid #c7a6ff30; border-radius: 12px; background: #c7a6ff0b; }}
+.control-row {{ display: flex; justify-content: space-between; align-items: center; gap: 14px; margin-top: 14px; }}
+label {{ display: block; margin: 14px 0 7px; color: #ddd6e9; font-size: 12px; font-weight: 700; }}
+input {{ width: 100%; padding: 12px 14px; border: 1px solid #494357; border-radius: 11px; outline: none; background: #14121b; color: var(--text); font: inherit; }}
+input:focus {{ border-color: var(--purple); box-shadow: 0 0 0 3px #c7a6ff20; }}
+button, .button {{ display: inline-flex; justify-content: center; align-items: center; gap: 8px; min-height: 42px; padding: 10px 16px; border: 0; border-radius: 11px; background: linear-gradient(100deg, var(--pink), var(--purple)); color: #21142c; font: inherit; font-weight: 800; text-decoration: none; cursor: pointer; transition: transform .15s ease, filter .15s ease; }}
+button:hover, .button:hover {{ transform: translateY(-1px); filter: brightness(1.08); }}
+button.danger {{ min-height: 34px; padding: 7px 11px; border: 1px solid #ff83cc40; background: #ff83cc12; color: #ff9bd6; font-size: 12px; }}
+.notice {{ margin: 16px 0; padding: 14px 16px; border: 1px solid #c7a6ff30; border-radius: 12px; background: #c7a6ff0b; color: #e5dcf4; }}
+.device-table-wrap {{ overflow-x: auto; }}
 table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ text-align: left; padding: 11px 8px; border-bottom: 1px solid #293648; vertical-align: top; }}
-code {{ color: #a9d1ff; overflow-wrap: anywhere; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }}
-.notice {{ padding: 12px; background: #192b3b; border-radius: 8px; margin: 12px 0; }}
+th, td {{ padding: 13px 10px; border-bottom: 1px solid #ffffff10; text-align: left; vertical-align: middle; }}
+th {{ color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }}
+td {{ font-size: 13px; }}
+tbody tr:last-child td {{ border-bottom: 0; }}
+.badge {{ padding: 5px 9px; font-size: 9px; }}
+.badge.online {{ color: var(--mint); border-color: #72edc245; }}
+.badge.offline {{ color: var(--muted); }}
+.empty {{ padding: 27px 15px; border: 1px dashed #494357; border-radius: 13px; color: var(--muted); text-align: center; }}
+.section-kicker {{ margin: 4px 0 17px; color: var(--muted); font-size: 13px; }}
+.trust-row {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+.trust-item {{ padding: 12px; border: 1px solid #ffffff10; border-radius: 12px; background: #ffffff05; }}
+.trust-item strong {{ display: block; margin-bottom: 4px; font-size: 12px; }}
+.trust-item span {{ color: var(--muted); font-size: 11px; }}
+footer {{ max-width: 1160px; margin: auto; padding: 22px 26px 34px; border-top: 1px solid #ffffff12; color: var(--muted); font-size: 11px; }}
+footer strong {{ color: #d7d0e2; }}
 form.inline {{ display: inline; }}
-@media (max-width: 620px) {{ main {{ margin-top: 20px; }} table {{ font-size: 14px; }} }}
+@media (max-width: 800px) {{ .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} .layout {{ grid-template-columns: 1fr; }} }}
+@media (max-width: 560px) {{ .topbar, main {{ padding-left: 17px; padding-right: 17px; }} .topbar {{ padding-top: 17px; }} .top-pill {{ display: none; }} .hero {{ align-items: flex-start; flex-direction: column; padding-top: 28px; }} .stats {{ gap: 9px; }} .stat {{ padding: 14px; }} .stat-value {{ font-size: 21px; }} .card {{ padding: 17px; }} .detail-grid, .trust-row {{ grid-template-columns: 1fr; }} footer {{ padding-left: 17px; padding-right: 17px; }} }}
 </style>
 </head>
-<body><main><h1>Scale2VPN</h1>{body}</main></body>
+<body>
+<header class="topbar">
+<a class="brand" href="/"><span class="brand-mark">S2</span><span>Scale2VPN<span class="brand-sub">BY HYPERFORGE STUDIOS</span></span></a>
+<span class="top-pill">PRIVATE ACCESS, PERFECTLY MANAGED</span>
+</header>
+<main>{body}</main>
+<footer><strong>Scale2VPN by Hyperforge Studios</strong> · Internal network: s2vpn<br>Legal business name: Nathan Thomas Matthews, doing business as Hyperforge Studios · North Carolina</footer>
+</body>
 </html>"""
 
 
@@ -391,63 +557,88 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def dashboard(self, notice=""):
         server = load_server()
-        devices = read_devices()
+        vpn_online = ipsec_service_active()
+        device_rows = device_status_rows(vpn_online)
+        connected_count = sum(1 for _, _, status in device_rows if status == "connected")
         csrf_token, csrf_cookie = self.get_csrf_cookie()
-        escaped_endpoint = html.escape(server["server_address"])
-        escaped_remote_id = html.escape(server["remote_id"])
+        endpoint = server["server_address"]
+        console_domain = server.get("console_domain", endpoint)
+        console_host = f"[{console_domain}]" if ":" in console_domain else console_domain
+        console_url = f"https://{console_host}:8443"
         routes = ", ".join(server["routes"])
-        console_url = f"https://{server['server_address']}"
-        if ":" in server["server_address"]:
-            console_url = f"https://[{server['server_address']}]"
-        body = f"""<p class="muted">Certificate-authenticated IKEv2 administration</p>
+        families = " + ".join(family.upper() for family in server["families"])
+        tunnel_state = "online" if vpn_online else "offline"
+        tunnel_text = "Tunnel service is running" if vpn_online else "Tunnel service is stopped"
+        body = f"""<section class="hero">
+<div><p class="eyebrow">Scale2VPN by Hyperforge Studios</p>
+<h1>Your network.<br><span class="gradient">Your rules.</span></h1>
+<p class="lede">A crisp control room for your private network. Create devices, check live tunnel status, and manage access from one place.</p></div>
+<div class="status-chip {tunnel_state}"><span class="status-dot"></span>{html.escape(tunnel_text)}</div>
+</section>
+<section class="stats" aria-label="Network overview">
+<div class="stat"><div class="stat-label">VPN service</div><div class="stat-value">{'Online' if vpn_online else 'Offline'}</div><div class="stat-caption">IKEv2 tunnel engine</div></div>
+<div class="stat"><div class="stat-label">Devices</div><div class="stat-value">{len(device_rows)}</div><div class="stat-caption">Provisioned identities</div></div>
+<div class="stat"><div class="stat-label">Connected now</div><div class="stat-value">{connected_count}</div><div class="stat-caption">Established IKEv2 sessions</div></div>
+<div class="stat"><div class="stat-label">Network support</div><div class="stat-value">{html.escape(families)}</div><div class="stat-caption">Configured address families</div></div>
+</section>
+<section class="layout">
 <section class="card">
-<h2>Server</h2>
-<div class="grid">
-<div><span class="muted">Server Address</span><br><code>{escaped_endpoint}</code></div>
-<div><span class="muted">Remote ID</span><br><code>{escaped_remote_id}</code></div>
-<div><span class="muted">Tunnel routes</span><br><code>{html.escape(routes)}</code></div>
+<div class="card-head"><div><p class="eyebrow">Live configuration</p><h2>Network overview</h2></div><span class="badge {'online' if vpn_online else 'offline'}">{'ACTIVE' if vpn_online else 'STOPPED'}</span></div>
+<div class="detail-grid">
+<div><span class="detail-label">Server address</span><code>{html.escape(endpoint)}</code></div>
+<div><span class="detail-label">Remote ID</span><code>{html.escape(server["remote_id"])}</code></div>
+<div><span class="detail-label">Tunnel routes</span><code>{html.escape(routes)}</code></div>
+<div><span class="detail-label">Browser security</span><code>{'Let’s Encrypt · trusted HTTPS' if server.get('console_domain') else 'Legacy certificate'}</code></div>
 </div>
-<p class="muted">Console: <a href="{html.escape(console_url)}:8443">{html.escape(console_url)}:8443</a></p>
+<a class="server-url" href="{html.escape(console_url, quote=True)}"><span class="detail-label">Admin console address</span><code>{html.escape(console_url)}</code></a>
+<div class="control-row"><span class="muted">{'Connected clients will be disconnected if you stop the VPN.' if vpn_online else 'The console remains available while the VPN is stopped.'}</span>
+<form method="post" action="/vpn"><input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
+<input type="hidden" name="action" value="{'stop' if vpn_online else 'start'}">
+<button class="{'danger' if vpn_online else ''}" type="submit">{'Stop VPN' if vpn_online else 'Start VPN'}</button></form></div>
 </section>
 <section class="card">
-<h2>Add a device</h2>
-<p class="muted">Each device gets a unique certificate identity and a one-time downloadable bundle.</p>
+<div class="card-head"><div><p class="eyebrow">Access management</p><h2>Add a device</h2></div><span aria-hidden="true">✦</span></div>
+<p class="section-kicker">Give a new device its own certificate and one-time setup bundle.</p>
 <form method="post" action="/devices">
 <input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
 <label for="display_name">Display Name</label>
 <input id="display_name" name="display_name" maxlength="64" required autocomplete="off" placeholder="e.g. Alex's phone">
-<p><button type="submit">Create device profile</button></p>
+<p><button type="submit">＋ &nbsp; Create device profile</button></p>
 </form>
 </section>
-<section class="card">
-<h2>Certificate trust chain</h2>
-<div class="grid">
-<div><strong>CA / Root</strong><br><code>Scale2VPN Root CA</code></div>
-<div><strong>MID / Intermediate</strong><br><code>Scale2VPN Intermediate CA</code></div>
-<div><strong>Device / Leaf</strong><br><code>Unique per-device certificate</code></div>
+</section>
+<section class="card" style="margin-top:16px">
+<div class="card-head"><div><p class="eyebrow">Certificate authentication</p><h2>Trusted device identity</h2></div></div>
+<div class="trust-row">
+<div class="trust-item"><strong>01 · Root CA</strong><span>Scale2VPN trust anchor</span></div>
+<div class="trust-item"><strong>02 · MID</strong><span>Intermediate signing authority</span></div>
+<div class="trust-item"><strong>03 · Device</strong><span>Unique certificate per device</span></div>
 </div>
-<p class="muted">The device certificate is signed by the intermediate; the intermediate is signed by the root CA. The full chain is included in each device bundle.</p>
+<p class="muted">Each device receives an individually issued certificate. Revoking a device prevents future authentication with its identity.</p>
 </section>"""
         if notice:
             body += f'<div class="notice">{html.escape(notice)}</div>'
-        body += "<section class=\"card\"><h2>Devices</h2>"
-        if not devices:
-            body += '<p class="muted">No devices have been issued yet.</p>'
+        body += """<section class="card" style="margin-top:16px">
+<div class="card-head"><div><p class="eyebrow">Your access list</p><h2>Devices</h2></div></div>"""
+        if not device_rows:
+            body += '<div class="empty">No devices yet. Create your first device profile above to get started.</div>'
         else:
-            body += "<table><thead><tr><th>Display Name</th><th>Local ID</th><th>Created</th><th></th></tr></thead><tbody>"
-            for device_id, device in sorted(devices.items(), key=lambda item: item[1]["created"]):
+            body += '<div class="device-table-wrap"><table><thead><tr><th>Device</th><th>Local ID</th><th>Added</th><th>Status</th><th></th></tr></thead><tbody>'
+            for device_id, device, status in device_rows:
+                status_class = "online" if status == "connected" else "offline"
                 body += (
                     "<tr>"
                     f"<td>{html.escape(device['display_name'])}</td>"
                     f"<td><code>{html.escape(device['local_id'])}</code></td>"
                     f"<td>{html.escape(device['created'])}</td>"
+                    f'<td><span class="badge {status_class}">{html.escape(status)}</span></td>'
                     "<td><form class=\"inline\" method=\"post\" action=\"/revoke\">"
                     f"<input type=\"hidden\" name=\"csrf_token\" value=\"{html.escape(csrf_token)}\">"
                     f"<input type=\"hidden\" name=\"device_id\" value=\"{html.escape(device_id)}\">"
                     '<button class="danger" type="submit">Revoke</button></form></td>'
                     "</tr>"
                 )
-            body += "</tbody></table>"
+            body += "</tbody></table></div>"
         body += "</section>"
         headers = {"Set-Cookie": csrf_cookie[1]} if csrf_cookie else None
         self.send_html(200, "Console", body, headers)
@@ -496,6 +687,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if not self.require_csrf(form.get("csrf_token", "")):
                 return
             route = urlparse(self.path).path
+            if route == "/vpn":
+                action = form.get("action", "")
+                if action not in ("start", "stop"):
+                    raise ValueError("Choose a valid VPN action.")
+                run_tool(["systemctl", action, "strongswan-starter.service"])
+                self.dashboard(f"VPN service {'started' if action == 'start' else 'stopped'}.")
+                return
             if route == "/devices":
                 display_name = validate_display_name(form.get("display_name", ""))
                 device_id, device, token = issue_device(display_name)
@@ -525,13 +723,111 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.send_html(500, "Operation failed", '<section class="card">The operation failed. Check <code>journalctl -u scale2vpn-console</code>.</section>')
 
 
+def device_status_rows(service_active=None):
+    devices = read_devices()
+    active_connections = set()
+    if (ipsec_service_active() if service_active is None else service_active):
+        status = run_tool(["ipsec", "statusall"]).decode("utf-8", errors="replace")
+        for line in status.splitlines():
+            match = re.match(r"^(scale2vpn-device-[0-9a-f]{24}): #\d+, ESTABLISHED\b", line)
+            if match:
+                active_connections.add(match.group(1).removeprefix("scale2vpn-device-"))
+
+    return [
+        (device_id, device, "connected" if device_id in active_connections else "disconnected")
+        for device_id, device in sorted(devices.items(), key=lambda item: item[1]["created"])
+    ]
+
+
+def console_cli(arguments):
+    if os.geteuid() != 0:
+        raise SystemExit("Scale2VPN: device management must run as root.")
+    if not arguments:
+        raise SystemExit("Usage: console.py device-create|device-delete|device-status ...")
+
+    command, *args = arguments
+    if command == "tls-setup":
+        if len(args) != 2:
+            raise SystemExit("Usage: scale2vpn tls setup <public-dns-name> <email>")
+        domain = configure_console_tls(args[0], args[1])
+        print(f"Let's Encrypt certificate configured for https://{domain}:8443")
+        return
+
+    if command == "device-create":
+        if len(args) != 1:
+            raise SystemExit("Usage: scale2vpn create <display-name>")
+        display_name = validate_display_name(args[0])
+        RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        device_id, device, token = issue_device(display_name)
+        download = PENDING_DOWNLOADS.pop(token)
+        output_dir = Path("/root/scale2vpn-devices")
+        output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(output_dir, 0o700)
+        bundle_path = output_dir / download["filename"]
+        if bundle_path.exists():
+            raise RuntimeError(f"Refusing to overwrite existing bundle: {bundle_path}")
+        atomic_write(bundle_path, download["bundle"], 0o600)
+        print(f"Created device: {device['display_name']}")
+        print(f"Device ID: {device_id}")
+        print(f"Local ID: {device['local_id']}")
+        print(f"Bundle: {bundle_path}")
+        print(f"PKCS#12 import password (shown once): {download['password']}")
+        return
+
+    if command == "device-delete":
+        if not 1 <= len(args) <= 2 or (len(args) == 2 and args[1] != "--yes"):
+            raise SystemExit("Usage: scale2vpn delete <device-id|local-id|display-name> [--yes]")
+        identifier = args[0]
+        devices = read_devices()
+        matches = [
+            (device_id, device)
+            for device_id, device in devices.items()
+            if identifier in (device_id, device["local_id"], device["display_name"])
+        ]
+        if not matches:
+            raise SystemExit(f"Scale2VPN: no device matches {identifier!r}.")
+        if len(matches) > 1:
+            ids = ", ".join(device_id for device_id, _ in matches)
+            raise SystemExit(f"Scale2VPN: identifier is ambiguous; use a device ID: {ids}")
+        device_id, device = matches[0]
+        if len(args) != 2:
+            confirmation = input(f"Type {device_id} to revoke {device['display_name']}: ")
+            if confirmation != device_id:
+                raise SystemExit("Scale2VPN: deletion cancelled.")
+        revoke_device(device_id)
+        print(f"Revoked device {device['display_name']} ({device_id}).")
+        return
+
+    if command == "device-status":
+        if args:
+            raise SystemExit("Usage: scale2vpn device status")
+        print(f"VPN service: {'on' if ipsec_service_active() else 'off'}")
+        print(f"{'DEVICE ID':24} {'DISPLAY NAME':24} {'LOCAL ID':18} STATUS")
+        rows = device_status_rows()
+        if not rows:
+            print("No devices.")
+            return
+        for device_id, device, status in rows:
+            print(
+                f"{device_id:24} {device['display_name'][:24]:24} "
+                f"{device['local_id']:18} {status}"
+            )
+        return
+
+    raise SystemExit(f"Scale2VPN: unknown device command {command!r}.")
+
+
 def main():
+    if len(sys.argv) > 1:
+        console_cli(sys.argv[1:])
+        return
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     server_config = load_server()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(certfile=SERVER_CERT, keyfile=SERVER_KEY)
+    certificate, private_key = console_tls_paths(server_config)
+    context.load_cert_chain(certfile=certificate, keyfile=private_key)
 
     servers = []
     if "ipv4" in server_config["families"]:

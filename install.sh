@@ -26,35 +26,49 @@ fi
     || fail "Scale2VPN scripts and service units must be alongside install.sh"
 
 while :; do
-    read -r -p "Public server address (DNS name, IPv4, or IPv6): " endpoint
+    read -r -p "Public VPN DNS name (required for trusted HTTPS, e.g. vpn.example.com): " endpoint
     if python3 -c '
 import ipaddress, re, sys
-value = sys.argv[1]
+value = sys.argv[1].lower().rstrip(".")
+labels = value.split(".")
+valid = len(value) <= 253 and len(labels) >= 2 and all(
+    re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+    for label in labels
+)
 try:
     ipaddress.ip_address(value)
-    valid = True
-except ValueError:
-    valid = len(value) <= 253 and not value.endswith(".") and all(
-        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-        for label in value.rstrip(".").split(".")
-    )
+    valid = False
+except ValueError: pass
 sys.exit(0 if valid else 1)
 ' "${endpoint}"; then
+        endpoint="${endpoint,,}"
+        endpoint="${endpoint%.}"
         break
     fi
-    printf 'Enter a valid DNS name, IPv4 address, or IPv6 address.\n' >&2
+    printf 'Enter a public DNS name (not an IP address) with at least two valid labels.\n' >&2
 done
 
-server_identity="$(python3 - "${endpoint}" <<'PY'
-import ipaddress
+read -r -p "Let's Encrypt contact email: " letsencrypt_email
+python3 - "${letsencrypt_email}" <<'PY'
+import re
 import sys
 
-value = sys.argv[1]
-try:
-    ipaddress.ip_address(value)
-    print(value)
-except ValueError:
-    print(f"@{value}")
+if not re.fullmatch(r"[^@\s]+@[^@\s.]+(?:\.[^@\s.]+)+", sys.argv[1].strip()):
+    raise SystemExit("Enter a valid email address for Let's Encrypt certificate notices.")
+PY
+
+server_identity="$(python3 - "${endpoint}" <<'PY'
+import sys
+
+print(f"@{sys.argv[1]}")
+PY
+)"
+console_cert_name="$(python3 - "${endpoint}" <<'PY'
+import hashlib
+import sys
+
+suffix = hashlib.sha256(sys.argv[1].encode("ascii")).hexdigest()[:16]
+print(f"s2vpn-{suffix}")
 PY
 )"
 public_interface="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
@@ -74,7 +88,7 @@ ssh_port=$((10#${ssh_port}))
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins ufw openssl python3 git
+apt-get install -y strongswan-starter strongswan-pki libcharon-extra-plugins ufw openssl python3 git certbot
 
 [[ -d "${IPSEC_DIR}" ]] || fail "strongSwan did not create ${IPSEC_DIR}"
 [[ ! -e "${IPSEC_DIR}/scale2vpn.conf" && ! -e "${IPSEC_DIR}/scale2vpn.secrets" \
@@ -196,6 +210,7 @@ with open(path, "w", encoding="utf-8") as output:
     json.dump({
         "display_name": "Scale2VPN",
         "server_address": endpoint,
+        "console_domain": endpoint,
         "remote_id": server_identity,
         "ipv4_pool": ipv4_pool or None,
         "ipv6_pool": ipv6_pool or None,
@@ -270,6 +285,7 @@ ufw allow "${ssh_port}/tcp"
 ufw allow 500/udp
 ufw allow 4500/udp
 ufw limit 8443/tcp
+ufw allow 80/tcp comment "Scale2VPN ACME validation"
 if [[ -n "${ipv4_pool}" ]]; then
     ufw route allow in on "${public_interface}" out on "${public_interface}" from "${ipv4_pool}" to any
 fi
@@ -278,17 +294,27 @@ if [[ -n "${ipv6_pool}" ]]; then
 fi
 ufw --force enable
 
+printf 'Requesting a trusted certificate for %s; DNS must resolve to this VPS and inbound TCP 80 must be reachable and unused.\n' "${endpoint}"
+certbot certonly --standalone --non-interactive --agree-tos \
+    --email "${letsencrypt_email}" --cert-name "${console_cert_name}" --domain "${endpoint}"
+install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/scale2vpn-reload-console <<'EOF'
+#!/bin/sh
+set -eu
+cert_name="$(/usr/bin/python3 -c 'import hashlib, json; domain=json.load(open("/etc/scale2vpn/server.json"))["console_domain"]; print("s2vpn-"+hashlib.sha256(domain.encode()).hexdigest()[:16])')"
+[ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/${cert_name}" ] || exit 0
+exec /usr/bin/systemctl restart scale2vpn-console.service
+EOF
+chmod 755 /etc/letsencrypt/renewal-hooks/deploy/scale2vpn-reload-console
+systemctl enable --now certbot.timer
+
 systemctl daemon-reload
 systemctl enable --now strongswan-starter.service
 systemctl enable --now scale2vpn-console.service
 
-printf '\nScale2VPN IKEv2 is running.\n'
+printf '\nScale2VPN IKEv2 and the management console are running.\n'
 printf 'Server address / remote ID: %s\n' "${endpoint}"
-if [[ "${endpoint}" == *:* ]]; then
-    printf 'Web console: https://[%s]:8443\n' "${endpoint}"
-else
-    printf 'Web console: https://%s:8443\n' "${endpoint}"
-fi
+printf 'Trusted HTTPS console: https://%s:8443\n' "${endpoint}"
 printf 'Console username: admin\nConsole password (shown once): %s\n' "${console_password}"
-printf 'UFW allows SSH on TCP %s, IKEv2 on UDP 500/4500, and the rate-limited console on TCP 8443.\n' "${ssh_port}"
+printf 'UFW allows SSH on TCP %s, HTTP validation on TCP 80, IKEv2 on UDP 500/4500, and the rate-limited console on TCP 8443.\n' "${ssh_port}"
 printf 'Also permit those ports in your VPS provider firewall/security group.\n'
